@@ -1,17 +1,19 @@
 {
-  description = "An over-engineered Hello World in bash";
+  description = "A Rust library for Etebase";
 
   # Nixpkgs / NixOS version to use.
   inputs.nixpkgs.url = "nixpkgs/nixos-21.05";
 
-  outputs = { self, nixpkgs }:
+  inputs.import-cargo.url = github:edolstra/import-cargo;
+
+  outputs = { self, nixpkgs, import-cargo }:
     let
 
       # Generate a user-friendly version numer.
       version = builtins.substring 0 8 self.lastModifiedDate;
 
       # System types to support.
-      supportedSystems = [ "x86_64-linux" "x86_64-darwin" ];
+      supportedSystems = [ "x86_64-linux" ];
 
       # Helper function to generate an attrset '{ x86_64-linux = f "x86_64-linux"; ... }'.
       forAllSystems = f: nixpkgs.lib.genAttrs supportedSystems (system: f system);
@@ -19,106 +21,65 @@
       # Nixpkgs instantiated for supported system types.
       nixpkgsFor = forAllSystems (system: import nixpkgs { inherit system; overlays = [ self.overlay ]; });
 
-    in
-
-    {
+    in {
 
       # A Nixpkgs overlay.
       overlay = final: prev: {
-
-        hello = with final; stdenv.mkDerivation rec {
-          name = "hello-${version}";
-
-          unpackPhase = ":";
-
+        
+        etebase-rs = with final; final.callPackage ({ inShell ? false }: stdenv.mkDerivation rec {
+          name = "etebase-rs-${version}";
+          
+          # In 'nix develop', we don't need a copy of the source tree
+          # in the Nix store.
+          src = if inShell then null else ./.;
+          
+          buildInputs =
+            [ rustc
+              cargo
+              openssl
+              pkg-config
+              libsodium
+            ] ++ (if inShell then [
+              # In 'nix develop', provide some developer tools.
+              rustfmt
+              clippy
+            ] else [
+              (import-cargo.builders.importCargo {
+                lockFile = ./Cargo.lock;
+                inherit pkgs;
+              }).cargoHome
+            ]);
+          
+          nativeBuildInputs = [ pkg-config libsodium ];
+          
           buildPhase =
             ''
-              cat > hello <<EOF
-              #! $SHELL
-              echo "Hello Nixers!"
-              EOF
-              chmod +x hello
+              export SODIUM_USE_PKG_CONFIG=1
+              export OPENSSL_DIR="${pkgs.openssl.dev}"
+              export OPENSSL_LIB_DIR="${pkgs.openssl.out}/lib"
             '';
-
+          
           installPhase =
             ''
-              mkdir -p $out/bin
-              cp hello $out/bin/
+              mkdir -p $out
+              cargo build --frozen --offline --out-dir $out -Z unstable-options 
             '';
-        };
-
+        }) {};
+        
       };
-
       # Provide some binary packages for selected system types.
       packages = forAllSystems (system:
         {
-          inherit (nixpkgsFor.${system}) hello;
+          inherit (nixpkgsFor.${system}) etebase-rs;
         });
 
       # The default package for 'nix build'. This makes sense if the
       # flake provides only one package or there is a clear "main"
       # package.
-      defaultPackage = forAllSystems (system: self.packages.${system}.hello);
+      defaultPackage = forAllSystems (system: self.packages.${system}.etebase-rs);
 
-      # A NixOS module, if applicable (e.g. if the package provides a system service).
-      nixosModules.hello =
-        { pkgs, ... }:
-        {
-          nixpkgs.overlays = [ self.overlay ];
-
-          environment.systemPackages = [ pkgs.hello ];
-
-          #systemd.services = { ... };
-        };
-
-      # Tests run by 'nix flake check' and by Hydra.
-      checks = forAllSystems
-        (system:
-          with nixpkgsFor.${system};
-
-          {
-            inherit (self.packages.${system}) hello;
-
-            # Additional tests, if applicable.
-            test = stdenv.mkDerivation {
-              name = "hello-test-${version}";
-
-              buildInputs = [ hello ];
-
-              unpackPhase = "true";
-
-              buildPhase = ''
-                echo 'running some integration tests'
-                [[ $(hello) = 'Hello Nixers!' ]]
-              '';
-
-              installPhase = "mkdir -p $out";
-            };
-          }
-
-          // lib.optionalAttrs stdenv.isLinux {
-            # A VM test of the NixOS module.
-            vmTest =
-              with import (nixpkgs + "/nixos/lib/testing-python.nix") {
-                inherit system;
-              };
-
-              makeTest {
-                nodes = {
-                  client = { ... }: {
-                    imports = [ self.nixosModules.hello ];
-                  };
-                };
-
-                testScript =
-                  ''
-                    start_all()
-                    client.wait_for_unit("multi-user.target")
-                    client.succeed("hello")
-                  '';
-              };
-          }
-        );
+      # Provide a 'nix develop' environment for interactive hacking.
+      devShell = forAllSystems (system: self.packages.${system}.etebase-rs.override { inShell = true; });
 
     };
 }
